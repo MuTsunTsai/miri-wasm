@@ -1,0 +1,48 @@
+# Builds Miri for wasm32-wasip1 from the rust-lang/rust sources.
+# build.sh copies this file to the root of the rust sources and substitutes @WASI_SDK@ and jobs with sed.
+change-id = "ignore"
+
+[llvm]
+# Stage 1 (the rustc running on Linux) uses the LLVM prebuilt by CI
+download-ci-llvm = true
+
+[rust]
+channel = "nightly"
+# Only the stage1 for the Linux host needs LLVM; see the target section below for the wasm host
+codegen-backends = ["llvm"]
+deny-warnings = false
+debug = false
+debug-assertions = false
+debuginfo-level = 0
+optimize = true
+incremental = false
+llvm-tools = false
+llvm-bitcode-linker = false
+lld = false
+# Remap the rust source paths to /rustc/<commit> (same as official releases) so that panic locations and similar
+# strings do not leak the builder's home directory.
+# Paths of dependency crates in the cargo registry are handled separately by build.sh via RUSTFLAGS_NOT_BOOTSTRAP.
+remap-debuginfo = true
+
+[build]
+build = "x86_64-unknown-linux-gnu"
+host = ["wasm32-wasip1"]
+target = ["x86_64-unknown-linux-gnu", "wasm32-wasip1"]
+docs = false
+extended = true
+tools = ["miri"]
+# Replaced by JOBS in build.sh. WSL gets about 8 GB of RAM by default; too much parallelism can OOM
+jobs = 8
+
+[target.wasm32-wasip1]
+wasi-root = "@WASI_SDK@/share/wasi-sysroot"
+linker = "@WASI_SDK@/bin/clang"
+# No code generation backend is needed (Miri only interprets MIR); "dummy" keeps bootstrap from building LLVM
+codegen-backends = ["dummy"]
+# Link with wasi-sdk's clang (not rust-lld). There are no threads whose stack size could be set, so the main
+# thread's stack is fixed at link time (only 1 MiB by default)
+rustflags = ["-Clink-self-contained=no", "-Clink-arg=-Wl,-z,stack-size=8388608"]
+
+[target.x86_64-unknown-linux-gnu]
+cc = "gcc"
+cxx = "g++"

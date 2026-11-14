@@ -1,0 +1,468 @@
+diff --git a/compiler/rustc_driver/Cargo.toml b/compiler/rustc_driver/Cargo.toml
+index 51909719827..bd6f96fd11a 100644
+--- a/compiler/rustc_driver/Cargo.toml
++++ b/compiler/rustc_driver/Cargo.toml
+@@ -4,7 +4,7 @@ version = "0.0.0"
+ edition = "2024"
+ 
+ [lib]
+-crate-type = ["dylib"]
++crate-type = ["lib", "dylib"]
+ 
+ [dependencies]
+ # tidy-alphabetical-start
+diff --git a/compiler/rustc_interface/src/util.rs b/compiler/rustc_interface/src/util.rs
+index d8198ff6cc8..aaccea6f83a 100644
+--- a/compiler/rustc_interface/src/util.rs
++++ b/compiler/rustc_interface/src/util.rs
+@@ -205,11 +205,22 @@ fn run_in_thread_with_globals<F: FnOnce(CurrentGcx) -> R + Send, R: Send>(
+     // the parallel compiler, in particular to ensure there is no accidental
+     // sharing of data between the main thread and the compilation thread
+     // (which might cause problems for the parallel compiler).
+-    let builder = thread::Builder::new().name("rustc".to_string()).stack_size(thread_stack_size);
+-
++    //
++    // wasm32-wasip1 has no threads: run on the main thread instead. The stack
++    // size is fixed at link time (`-zstack-size`).
++    #[cfg(target_os = "wasi")]
++    {
++        let _ = thread_stack_size;
++        rustc_span::create_session_globals_then(edition, extra_symbols, Some(sm_inputs), || {
++            f(CurrentGcx::new())
++        })
++    }
++    #[cfg(not(target_os = "wasi"))]
+     // We build the session globals and run `f` on the spawned thread, because
+     // `SessionGlobals` does not impl `Send` in the non-parallel compiler.
+     thread::scope(|s| {
++        let builder =
++            thread::Builder::new().name("rustc".to_string()).stack_size(thread_stack_size);
+         // `unwrap` is ok here because `spawn_scoped` only panics if the thread
+         // name contains null bytes.
+         let r = builder
+diff --git a/compiler/rustc_metadata/src/host_dylib.rs b/compiler/rustc_metadata/src/host_dylib.rs
+index ad76eb4eb82..e29390274b6 100644
+--- a/compiler/rustc_metadata/src/host_dylib.rs
++++ b/compiler/rustc_metadata/src/host_dylib.rs
+@@ -9,10 +9,12 @@
+ 
+ use crate::locator::CrateError;
+ 
++#[cfg(not(target_os = "wasi"))]
+ fn format_dlopen_err(e: &(dyn std::error::Error + 'static)) -> String {
+     e.sources().map(|e| format!(": {e}")).collect()
+ }
+ 
++#[cfg(not(target_os = "wasi"))]
+ fn attempt_load_dylib(path: &Path) -> Result<libloading::Library, libloading::Error> {
+     #[cfg(target_os = "aix")]
+     if let Some(ext) = path.extension()
+@@ -40,6 +42,7 @@ fn attempt_load_dylib(path: &Path) -> Result<libloading::Library, libloading::Er
+ // proc-macro DLL with `Error::LoadLibraryExW`. It is suspected that something in the
+ // system still holds a lock on the file, so we retry a few times before calling it
+ // an error.
++#[cfg(not(target_os = "wasi"))]
+ fn load_dylib(path: &Path, max_attempts: usize) -> Result<libloading::Library, String> {
+     assert!(max_attempts > 0);
+ 
+@@ -103,6 +106,19 @@ fn from(err: DylibError) -> CrateError {
+     }
+ }
+ 
++// wasm32-wasip1 cannot dlopen anything (proc macros, codegen backends).
++#[cfg(target_os = "wasi")]
++pub unsafe fn load_symbol_from_dylib<T: Copy>(
++    path: &Path,
++    _sym_name: &str,
++) -> Result<T, DylibError> {
++    Err(DylibError::DlOpen(
++        path.display().to_string(),
++        "dlopen is not supported on this platform".to_owned(),
++    ))
++}
++
++#[cfg(not(target_os = "wasi"))]
+ pub unsafe fn load_symbol_from_dylib<T: Copy>(
+     path: &Path,
+     sym_name: &str,
+diff --git a/compiler/rustc_session/src/filesearch.rs b/compiler/rustc_session/src/filesearch.rs
+index 10c62d932ba..53dd992e211 100644
+--- a/compiler/rustc_session/src/filesearch.rs
++++ b/compiler/rustc_session/src/filesearch.rs
+@@ -341,6 +341,12 @@ fn from_env_args_next() -> Option<PathBuf> {
+         rustlib_path.exists().then_some(p)
+     }
+ 
++    // wasm32-wasip1: there is no rustc_driver dylib to locate; use a fixed path
++    // (callers are expected to pass `--sysroot` explicitly anyway).
++    if cfg!(target_os = "wasi") {
++        return from_env_args_next().unwrap_or_else(|| PathBuf::from("/sysroot"));
++    }
++
+     from_env_args_next()
+         .unwrap_or_else(|| default_from_rustc_driver_dll().expect("Failed finding sysroot"))
+ }
+diff --git a/src/bootstrap/src/core/build_steps/compile.rs b/src/bootstrap/src/core/build_steps/compile.rs
+index 3021f52d159..360b11cfc52 100644
+--- a/src/bootstrap/src/core/build_steps/compile.rs
++++ b/src/bootstrap/src/core/build_steps/compile.rs
+@@ -1150,6 +1150,9 @@ fn run(self, builder: &Builder<'_>) -> Self::Output {
+             target,
+         );
+         let stamp = build_stamp::librustc_stamp(builder, build_compiler, target);
++        // wasm32-wasip1 host: there is no librustc_driver dylib, so tools such as Miri must
++        // link statically against every rustc crate's rlib.
++        let keep_rlibs = target.contains("wasm");
+ 
+         run_cargo(
+             builder,
+@@ -1157,7 +1160,10 @@ fn run(self, builder: &Builder<'_>) -> Self::Output {
+             vec![],
+             &stamp,
+             vec![],
+-            ArtifactKeepMode::Custom(Box::new(|filename| {
++            ArtifactKeepMode::Custom(Box::new(move |filename| {
++                if keep_rlibs && filename.ends_with(".rlib") {
++                    return true;
++                }
+                 if filename.contains("jemalloc_sys")
+                     || filename.contains("rustc_public_bridge")
+                     || filename.contains("rustc_public")
+diff --git a/src/bootstrap/src/core/build_steps/tool.rs b/src/bootstrap/src/core/build_steps/tool.rs
+index c4fae69645e..f8566ea2474 100644
+--- a/src/bootstrap/src/core/build_steps/tool.rs
++++ b/src/bootstrap/src/core/build_steps/tool.rs
+@@ -1601,7 +1601,8 @@ fn build_extended_rustc_tool(
+     stable: false,
+     add_bins_to_sysroot: ["miri"],
+     // Always compile also tests when building miri. Otherwise feature unification can cause rebuilds between building and testing miri.
+-    cargo_args: &["--all-targets"],
++    // wasm32-wasip1 host: test targets cannot link against the rlib-only rustc crates.
++    cargo_args: &["--bins"],
+ });
+ tool_rustc_extended!(CargoMiri {
+     path: "src/tools/miri/cargo-miri",
+diff --git a/src/tools/miri/Cargo.toml b/src/tools/miri/Cargo.toml
+index bf46b52cb66..0af4781b79b 100644
+--- a/src/tools/miri/Cargo.toml
++++ b/src/tools/miri/Cargo.toml
+@@ -35,6 +35,9 @@ directories = "6"
+ bitflags = "2.6"
+ serde_json = { version = "1.0", optional = true }
+ mio = { version = "1.1.1", features = ["os-poll", "net"] }
++
++# socket2 does not support wasm32-wasip1 (see src/shims/unix/wasi_net.rs).
++[target.'cfg(not(target_os = "wasi"))'.dependencies]
+ socket2 = "0.6.5"
+ 
+ # Only used by priroda binary.
+diff --git a/src/tools/miri/src/concurrency/blocking_io.rs b/src/tools/miri/src/concurrency/blocking_io.rs
+index 3d85db9563c..74b16bc6393 100644
+--- a/src/tools/miri/src/concurrency/blocking_io.rs
++++ b/src/tools/miri/src/concurrency/blocking_io.rs
+@@ -119,6 +119,13 @@ fn poll<'tcx>(
+         ecx: &mut MiriInterpCx<'tcx>,
+         timeout: Option<Duration>,
+     ) -> InterpResult<'tcx, Result<(), io::Error>> {
++        // wasm32-wasip1 host: there are no host sockets (see shims/unix/wasi_net.rs), so there is
++        // never anything to poll; mio's `poll_oneoff` is also unreliable in browser WASI shims.
++        // A non-zero timeout just means the scheduler spins until the deadline instead of sleeping.
++        if cfg!(target_os = "wasi") {
++            let _ = timeout;
++            return interp_ok(Ok(()));
++        }
+         let poll = ecx
+             .machine
+             .blocking_io
+diff --git a/src/tools/miri/src/shims/env.rs b/src/tools/miri/src/shims/env.rs
+index b85685d844a..d34ad441d0b 100644
+--- a/src/tools/miri/src/shims/env.rs
++++ b/src/tools/miri/src/shims/env.rs
+@@ -106,7 +106,12 @@ fn get_env_var(&mut self, name: &OsStr) -> InterpResult<'tcx, Option<OsString>>
+     /// Get the process identifier.
+     fn get_pid(&self) -> u32 {
+         let ecx = self.eval_context_ref();
+-        if ecx.machine.communicate() { std::process::id() } else { 1000 }
++        // wasm32-wasip1 host: `std::process::id()` panics ("no pids on this platform").
++        if ecx.machine.communicate() && cfg!(not(target_os = "wasi")) {
++            std::process::id()
++        } else {
++            1000
++        }
+     }
+ 
+     /// Get an "OS" thread ID for any thread.
+diff --git a/src/tools/miri/src/shims/files.rs b/src/tools/miri/src/shims/files.rs
+index 4bf610143f6..d4c56cafb2e 100644
+--- a/src/tools/miri/src/shims/files.rs
++++ b/src/tools/miri/src/shims/files.rs
+@@ -816,6 +816,11 @@ pub fn open_file_or_dir(
+                 use std::os::windows::io::OwnedHandle;
+                 Ok(Either::Right(OwnedHandle::from(file).into()))
+             }
++            _ => {
++                // e.g. wasm32-wasip1 host: `fs::Dir` cannot be created from a file there.
++                let _ = file;
++                Err(io::ErrorKind::Unsupported.into())
++            }
+         }
+     } else {
+         Ok(Either::Left(file))
+diff --git a/src/tools/miri/src/shims/os_str.rs b/src/tools/miri/src/shims/os_str.rs
+index e12acb341f4..8172f3bd3de 100644
+--- a/src/tools/miri/src/shims/os_str.rs
++++ b/src/tools/miri/src/shims/os_str.rs
+@@ -358,7 +358,12 @@ fn unix_to_windows<T>(path: &mut Vec<T>)
+                     windows_to_unix(&mut path);
+                 }
+             }
+-            Cow::Owned(OsString::from_vec(path))
++            #[cfg(unix)]
++            let path = OsString::from_vec(path);
++            // SAFETY: `path` came from `into_encoded_bytes` and only ASCII separators were changed.
++            #[cfg(not(unix))]
++            let path = unsafe { OsString::from_encoded_bytes_unchecked(path) };
++            Cow::Owned(path)
+         } else {
+             // Unix-on-Unix, all is fine.
+             os_str
+diff --git a/src/tools/miri/src/shims/unix/fs.rs b/src/tools/miri/src/shims/unix/fs.rs
+index 383c505684e..84f1e5c1a16 100644
+--- a/src/tools/miri/src/shims/unix/fs.rs
++++ b/src/tools/miri/src/shims/unix/fs.rs
+@@ -262,6 +262,10 @@ fn same_host_file(file1: &fs::Metadata, file2: &fs::Metadata) -> bool {
+             file1.volume_serial_number().unwrap() == file2.volume_serial_number().unwrap()
+                 && file1.file_index().unwrap() == file2.file_index().unwrap()
+         }
++        _ => {
++            let _ = (file1, file2);
++            false
++        }
+     }
+ }
+ 
+@@ -416,6 +420,13 @@ fn dir_entry_fields(
+                             ino: 0u64,
+                         }
+                     }
++                    _ => {
++                        DirEntry {
++                            name: dir_entry.file_name(),
++                            d_type: this.eval_libc("DT_UNKNOWN").to_u8()?.into(),
++                            ino: 0u64,
++                        }
++                    }
+                 }
+             }
+             Either::Right(special) =>
+@@ -680,6 +691,9 @@ fn open(
+                     custom_flags |=
+                         windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+                 }
++                _ => {
++                    throw_unsup_format!("{open_name}: `O_NOFOLLOW` is not supported on this host");
++                }
+             }
+         }
+ 
+@@ -724,12 +738,14 @@ fn open(
+             &path
+         };
+ 
++        // `custom_flags` only exists on Unix and Windows hosts.
++        #[cfg(any(unix, windows))]
++        options.custom_flags(custom_flags);
++        #[cfg(not(any(unix, windows)))]
++        let _: i32 = custom_flags;
++
+         // Let's see what we get when we open this!
+-        let f_or_d = open_file_or_dir(
+-            dirfd.as_ref().map(|d| &d.dir),
+-            path,
+-            options.custom_flags(custom_flags),
+-        );
++        let f_or_d = open_file_or_dir(dirfd.as_ref().map(|d| &d.dir), path, &options);
+         match f_or_d {
+             Err(err) => ecx.set_errno_and_return_neg1_i32(err),
+             Ok(Either::Right(dir)) => {
+@@ -832,6 +848,7 @@ fn unlink(&mut self, path_op: &OpTy<'tcx>) -> InterpResult<'tcx, Scalar> {
+                     fs::remove_file(path)
+                 }
+             }}
++            _ => fs::remove_file(path),
+         };
+         interp_ok(Scalar::from_i32(this.try_unwrap_io_result(result.map(|()| 0))?))
+     }
+@@ -858,6 +875,10 @@ fn create_link(target: &Path, link: &Path) -> std::io::Result<()> {
+                         fs::symlink_file(target, link)
+                     }
+                 }
++                _ => {
++                    let _ = (target, link);
++                    Err(std::io::ErrorKind::Unsupported.into())
++                }
+             }
+         }
+ 
+@@ -1383,6 +1404,7 @@ fn rmdir(&mut self, path_op: &OpTy<'tcx>) -> InterpResult<'tcx, Scalar> {
+                     fs::remove_dir(path)
+                 }
+             }}
++            _ => fs::remove_dir(path),
+         };
+ 
+         interp_ok(Scalar::from_i32(this.try_unwrap_io_result(result.map(|_| 0i32))?))
+diff --git a/src/tools/miri/src/shims/unix/mod.rs b/src/tools/miri/src/shims/unix/mod.rs
+index e03cbecd341..8663d71cd73 100644
+--- a/src/tools/miri/src/shims/unix/mod.rs
++++ b/src/tools/miri/src/shims/unix/mod.rs
+@@ -8,10 +8,14 @@
+ mod socket;
+ mod socket_address;
+ mod sync;
++#[cfg(not(target_os = "wasi"))]
+ mod tcp_socket;
+ mod thread;
++#[cfg(not(target_os = "wasi"))]
+ mod udp_socket;
+ mod virtual_socket;
++#[cfg(target_os = "wasi")]
++mod wasi_net;
+ 
+ mod android;
+ mod freebsd;
+diff --git a/src/tools/miri/src/shims/unix/socket.rs b/src/tools/miri/src/shims/unix/socket.rs
+index 55644d8b6f0..b3e2a4a690c 100644
+--- a/src/tools/miri/src/shims/unix/socket.rs
++++ b/src/tools/miri/src/shims/unix/socket.rs
+@@ -8,8 +8,12 @@
+ use crate::shims::files::FdNum;
+ use crate::shims::unix::UnixFileDescription;
+ use crate::shims::unix::socket_address::EvalContextExt as _;
++#[cfg(not(target_os = "wasi"))]
+ use crate::shims::unix::tcp_socket::TcpSocket;
++#[cfg(not(target_os = "wasi"))]
+ use crate::shims::unix::udp_socket::UdpSocket;
++#[cfg(target_os = "wasi")]
++use crate::shims::unix::wasi_net::{TcpSocket, UdpSocket, socket2};
+ use crate::shims::{FileDescription, FileDescriptionRef};
+ use crate::*;
+ 
+diff --git a/src/tools/miri/src/shims/unix/wasi_net.rs b/src/tools/miri/src/shims/unix/wasi_net.rs
+new file mode 100644
+index 00000000000..e1ae4ac83ce
+--- /dev/null
++++ b/src/tools/miri/src/shims/unix/wasi_net.rs
+@@ -0,0 +1,99 @@
++//! Stand-ins for host networking when Miri itself runs on `wasm32-wasip1`.
++//!
++//! `socket2` refuses to compile for wasip1 and `mio` has no `UdpSocket` on WASI, so the
++//! real `tcp_socket` / `udp_socket` modules are left out on that host. `socket.rs` still
++//! compiles against the tiny `socket2` facade below; creating a host socket always fails
++//! with `Unsupported`, so the facade's `SockRef` can never actually be constructed.
++
++use std::io;
++
++use crate::shims::unix::UnixFileDescription;
++use crate::shims::FileDescriptionRef;
++use crate::*;
++
++pub mod socket2 {
++    use std::convert::Infallible;
++    use std::io;
++    use std::marker::PhantomData;
++    use std::time::Duration;
++
++    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
++    pub struct Domain(i32);
++
++    impl Domain {
++        pub const IPV4: Domain = Domain(2);
++        pub const IPV6: Domain = Domain(10);
++    }
++
++    /// Uninhabited: there is never an underlying host socket on wasip1.
++    pub struct SockRef<'a>(Infallible, PhantomData<&'a ()>);
++
++    impl SockRef<'_> {
++        pub fn set_reuse_address(&self, _: bool) -> io::Result<()> {
++            match self.0 {}
++        }
++        pub fn reuse_address(&self) -> io::Result<bool> {
++            match self.0 {}
++        }
++        pub fn set_linger(&self, _: Option<Duration>) -> io::Result<()> {
++            match self.0 {}
++        }
++        pub fn linger(&self) -> io::Result<Option<Duration>> {
++            match self.0 {}
++        }
++        pub fn set_keepalive(&self, _: bool) -> io::Result<()> {
++            match self.0 {}
++        }
++        pub fn keepalive(&self) -> io::Result<bool> {
++            match self.0 {}
++        }
++        pub fn set_ttl_v4(&self, _: u32) -> io::Result<()> {
++            match self.0 {}
++        }
++        pub fn ttl_v4(&self) -> io::Result<u32> {
++            match self.0 {}
++        }
++        pub fn set_tcp_nodelay(&self, _: bool) -> io::Result<()> {
++            match self.0 {}
++        }
++        pub fn tcp_nodelay(&self) -> io::Result<bool> {
++            match self.0 {}
++        }
++    }
++}
++
++/// Uninhabited placeholder for a host socket file description.
++pub enum NoSocket {}
++
++impl NoSocket {
++    pub fn as_unix(self) -> FileDescriptionRef<dyn UnixFileDescription> {
++        match self {}
++    }
++}
++
++fn unsupported() -> io::Error {
++    io::Error::new(io::ErrorKind::Unsupported, "host sockets are not supported on wasm32-wasip1")
++}
++
++pub struct TcpSocket;
++pub struct UdpSocket;
++
++impl TcpSocket {
++    pub fn new<'tcx>(
++        _family: socket2::Domain,
++        _is_non_block: bool,
++        _ecx: &mut MiriInterpCx<'tcx>,
++    ) -> io::Result<NoSocket> {
++        Err(unsupported())
++    }
++}
++
++impl UdpSocket {
++    pub fn new<'tcx>(
++        _family: socket2::Domain,
++        _is_non_block: bool,
++        _ecx: &mut MiriInterpCx<'tcx>,
++    ) -> io::Result<NoSocket> {
++        Err(unsupported())
++    }
++}
+diff --git a/src/tools/miri/src/shims/windows/foreign_items.rs b/src/tools/miri/src/shims/windows/foreign_items.rs
+index 7e5f545bffb..52ebaa18533 100644
+--- a/src/tools/miri/src/shims/windows/foreign_items.rs
++++ b/src/tools/miri/src/shims/windows/foreign_items.rs
+@@ -28,7 +28,7 @@ fn win_get_full_path_name<'tcx>(path: &Path) -> InterpResult<'tcx, io::Result<Pa
+     interp_ok(path::absolute(path))
+ }
+ 
+-#[cfg(unix)]
++#[cfg(not(windows))]
+ #[expect(clippy::get_first, clippy::arithmetic_side_effects)]
+ fn win_get_full_path_name<'tcx>(path: &Path) -> InterpResult<'tcx, io::Result<PathBuf>> {
+     use std::sync::LazyLock;

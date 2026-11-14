@@ -1,0 +1,18 @@
+miri-wasm
+https://github.com/mutsuntsai/miri-wasm
+
+This project is licensed under MIT OR Apache-2.0 (see LICENSE-MIT and LICENSE-APACHE),
+the same as the Rust project.
+
+build/miri-wasm.patch modifies the source code of the Rust project
+(https://github.com/rust-lang/rust). That source code is copyrighted by the
+Rust project contributors and licensed under MIT OR Apache-2.0.
+
+The files in the GitHub Releases (miri.wasm and the standard library rlib/rmeta
+files) are build artifacts of the Rust project. They also include third-party
+crates that Rust depends on; see the license files of each crate in the
+rust-lang/rust source tree for their licenses.
+
+The approach of compiling Miri to WASM and running it in the browser with a
+WASI shim is based on LyonSyonII/rubri (https://github.com/LyonSyonII/rubri,
+MIT License).

@@ -1,0 +1,23 @@
+{
+	"name": "miri-wasm",
+	"version": "0.0.0",
+	"private": true,
+	"description": "Miri compiled to wasm32-wasip1, for running Rust in the browser",
+	"license": "MIT OR Apache-2.0",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/mutsuntsai/miri-wasm.git"
+	},
+	"type": "module",
+	"engines": {
+		"node": ">=24"
+	},
+	"scripts": {
+		"pack": "node scripts/pack.mjs",
+		"test": "node tests/run-tests.mjs",
+		"bench": "node tests/bench.mjs"
+	},
+	"devDependencies": {
+		"@bjorn3/browser_wasi_shim": "0.4.2"
+	}
+}
